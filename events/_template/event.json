@@ -1,0 +1,8 @@
+{
+  "id": "_template",
+  "title": "Week 42: Staff sprint",
+  "description": "What the run asks of players. Shown under Details in the planner.",
+  "rules": "Optional. Extra rules players agree to follow, such as no Arcana changes.",
+  "startsAt": "2026-10-12T00:00:00Z",
+  "endsAt": "2026-10-19T00:00:00Z"
+}

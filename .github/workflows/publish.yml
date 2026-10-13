@@ -1,0 +1,266 @@
+name: Publish events
+run-name: Publish events${{ inputs.dry_run && ' (dry run)' || '' }}
+
+# Compiles every active event for the module build of the planner's latest release, merges the
+# plans the published feed already carries for older builds, signs the feed with the event key
+# and replaces the assets of this repository's `events` release.
+#
+# Runs daily: the planner chooses the active event by time itself, so the feed only needs
+# rebuilding when events change (push) or a planner release brings a new module build. Dispatch
+# it by hand right after a planner release to cut that wait, or wire the optional
+# `planner-release` repository dispatch (see README). GitHub pauses schedules after 60 days
+# without repository activity; any push or a manual run resumes them.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check the feed and print its summary; sign and upload nothing"
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches: [main]
+    paths: ["events/**"]
+  schedule:
+    - cron: "17 5 * * *"
+  repository_dispatch:
+    types: [planner-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  # The planner repository whose releases compile and run the events.
+  PLANNER_REPOSITORY: maybe-adamant/RunPlanner
+
+jobs:
+  build:
+    name: Build the event feed
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      planner_tag: ${{ steps.planner.outputs.tag }}
+
+    steps:
+      - name: Check out events
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: events-repo
+          persist-credentials: false
+
+      # The release's module-build.json names the build it ships, from its own Rust assembly.
+      - name: Find the planner release and its module build
+        id: planner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api "repos/${PLANNER_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if ! gh release download "${tag}" -R "${PLANNER_REPOSITORY}" -p module-build.json -D module; then
+            echo "Planner ${tag} has no module-build.json; release a planner with community events first." >&2
+            exit 1
+          fi
+          build_id="$(jq -r .buildId module/module-build.json)"
+          if ! [[ "${build_id}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Planner ${tag} module-build.json names no module build." >&2
+            exit 1
+          fi
+          {
+            echo "tag=${tag}"
+            echo "build_id=${build_id}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Check out the planner release
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.PLANNER_REPOSITORY }}
+          ref: ${{ steps.planner.outputs.tag }}
+          path: planner
+          persist-credentials: false
+
+      - name: Require the planner's event builder and key
+        run: |
+          if [ ! -f planner/scripts/events-build.mjs ]; then
+            echo 'The planner release predates community events.' >&2
+            exit 1
+          fi
+          if grep -q '^PLACEHOLDER' planner/apps/planner/src-tauri/event-feed.pub; then
+            echo 'The planner release ships the placeholder event key; install the real key first.' >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: planner/.nvmrc
+          cache: npm
+          cache-dependency-path: planner/package-lock.json
+
+      - name: Install planner dependencies
+        working-directory: planner
+        run: npm ci --ignore-scripts
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-08-03
+
+      # Plans for older module builds are kept only from a feed this key verifies. Only a missing
+      # release starts afresh; once it exists, a feed that is missing or fails verification
+      # fails the job (see README, Recovering a failed publish).
+      - name: Download and verify the published feed
+        id: published
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p published
+          if ! gh release view events >/dev/null 2>&1; then
+            echo 'No events release yet; building without older plans.'
+            echo "previous=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          gh release download events -p events.json -p events.json.sig -D published
+          (cd planner && cargo run --quiet --release --locked \
+            --manifest-path apps/planner/src-tauri/Cargo.toml \
+            -p run-planner-game-host --example events_ci -- \
+            verify ../published/events.json ../published/events.json.sig \
+            "$(cat apps/planner/src-tauri/event-feed.pub)")
+          echo "previous=published/events.json" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and check the feed
+        env:
+          BUILD_ID: ${{ steps.planner.outputs.build_id }}
+          PREVIOUS: ${{ steps.published.outputs.previous }}
+        run: |
+          previous=()
+          if [ -n "${PREVIOUS}" ]; then previous=(--previous "../${PREVIOUS}"); fi
+          (cd planner && npm run events:build -- \
+            --events ../events-repo/events --out ../out --build-id "${BUILD_ID}" "${previous[@]}")
+          # The planner's own decoder must accept every listed event.
+          (cd planner && cargo run --quiet --release --locked \
+            --manifest-path apps/planner/src-tauri/Cargo.toml \
+            -p run-planner-game-host --example events_ci -- check ../out/events.json "${BUILD_ID}")
+
+      # Project files are named by hash in the feed, so an unchanged feed means unchanged assets;
+      # republishing it would only move the signature timestamp.
+      - name: Compare with the published feed
+        id: compare
+        env:
+          PREVIOUS: ${{ steps.published.outputs.previous }}
+          PLANNER_TAG: ${{ steps.planner.outputs.tag }}
+        run: |
+          if [ -n "${PREVIOUS}" ] && cmp -s out/events.json "${PREVIOUS}"; then
+            changed=false
+          else
+            changed=true
+          fi
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "Planner ${PLANNER_TAG}; feed changed: ${changed}"
+            echo
+            cat out/summary.txt
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: Keep the unsigned feed for publishing
+        if: ${{ steps.compare.outputs.changed == 'true' && !inputs.dry_run }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: event-feed
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign and publish the event feed
+    needs: build
+    if: ${{ needs.build.outputs.changed == 'true' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Optional owner approval: protect this environment in the repository settings.
+    environment: events-publish
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the planner release
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ env.PLANNER_REPOSITORY }}
+          ref: ${{ needs.build.outputs.planner_tag }}
+          path: planner
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: planner/.nvmrc
+          cache: npm
+          cache-dependency-path: planner/package-lock.json
+
+      - name: Install planner dependencies
+        working-directory: planner
+        run: npm ci --ignore-scripts
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-08-03
+
+      - name: Download the unsigned feed
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: event-feed
+          path: out
+
+      # The event key reaches this step alone.
+      - name: Sign the feed
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.EVENTS_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.EVENTS_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo 'The EVENTS_SIGNING_PRIVATE_KEY secret must hold the event signing key.' >&2
+            exit 1
+          fi
+          node planner/node_modules/@tauri-apps/cli/tauri.js signer sign out/events.json
+          if [ ! -f out/events.json.sig ]; then
+            echo 'The event feed signature was not produced.' >&2
+            exit 1
+          fi
+
+      # The planner release's key must accept the signature, so a wrong key never publishes.
+      - name: Verify the signature
+        run: |
+          (cd planner && cargo run --quiet --release --locked \
+            --manifest-path apps/planner/src-tauri/Cargo.toml \
+            -p run-planner-game-host --example events_ci -- \
+            verify ../out/events.json ../out/events.json.sig \
+            "$(cat apps/planner/src-tauri/event-feed.pub)")
+
+      # Kept so a half-finished upload can be completed by hand (see README).
+      - name: Keep the signed feed
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: event-feed-signed
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload to the events release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view events >/dev/null 2>&1; then
+            gh release create events --prerelease --latest=false \
+              --title 'Community events' \
+              --notes 'The signed Run Planner community event feed, replaced in place by the publish workflow.'
+          fi
+          gh release edit events --prerelease --latest=false
+          mapfile -t projects < <(find out -maxdepth 1 -type f -name '*.runplanner.json' | sort)
+          # Projects first, then the feed and its signature together.
+          if [ "${#projects[@]}" -gt 0 ]; then
+            gh release upload events "${projects[@]}" --clobber
+          fi
+          gh release upload events out/events.json out/events.json.sig --clobber
