@@ -23,15 +23,23 @@
      characters each. No invisible formatting characters.
    - Times are UTC (`Z`). The event is active from `startsAt` until just before `endsAt`; if two
      overlap, the later start wins. Ended events are not published.
-   - No other fields: the project's URL and hash are added when the feed is built.
+   - No other fields: the project's URL, hash and schema version are added when the feed is
+     built.
 
 3. **Check it locally** (optional): `scripts/check-local.sh <path-to-RunPlanner-checkout>`.
 4. **Open a pull request.** The validation check compiles every event with the planner's latest
    release. Once merged, the publish workflow builds, signs and publishes the feed.
 
-Changing an event's project later drops the plans compiled for older planner versions, so
-players on those versions lose the event until they update. Changing only `event.json` keeps
-them.
+## What players receive
+
+The feed lists each event with its project's URL, SHA-256 hash and `schemaVersion`; it holds no
+compiled plans. Each planner downloads the active event's project, checks its hash and compiles
+it for the game module it installs, so the event keeps working across planner and module
+releases.
+
+A planner plays an event only when the project's `schemaVersion` is within the range that
+planner loads. A project saved by a newer planner than a player has asks that player to update
+the planner first, so save event projects with a released planner, not a development build.
 
 `_template/` holds an example `event.json` and an empty starting project; folders whose name
 starts with `_` are never published.

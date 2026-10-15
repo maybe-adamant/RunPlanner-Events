@@ -30,37 +30,27 @@ See [events/README.md](events/README.md) to write an event.
 `publish.yml` runs daily, on every push to `main` that touches `events/`, and by hand
 (**Run workflow**, with **dry run** on by default). It:
 
-1. reads `module-build.json` from the planner's latest release, which names the game module
-   build that release ships;
-2. checks out the planner at that release and compiles every event that has not ended through
-   the planner's own event builder (`npm run events:build`), so plans match what that app and
-   game module accept;
-3. keeps the plans the published feed already carries for older module builds (after verifying
-   that feed's signature), so players who have not updated keep the event;
-4. stops if the feed is unchanged; otherwise signs `events.json` with the event key and replaces
-   `events.json`, `events.json.sig` and each `<event-id>.runplanner.json` on the `events`
-   release.
+1. checks out the planner's latest release and builds the feed with its event builder
+   (`npm run events:build`), which lists every event that has not ended with its project's URL,
+   hash and schema version, and compiles each project to refuse one that would not play;
+2. checks the feed with the planner's own decoder;
+3. stops if the published feed is identical and its signature verifies; otherwise signs
+   `events.json` with the event key, verifies the signature with the planner's public key, and
+   replaces each `<event-id>.runplanner.json` and then `events.json` and `events.json.sig` on the
+   `events` release.
 
-The planner chooses the active event by time itself, so an event starts and ends on its dates
-without another publish. Run the workflow by hand after a planner release so new versions get
-plans without waiting for the daily run, or have the planner's release send a
-`planner-release` repository dispatch here (that needs a token with access to this
-repository, which the planner's workflows do not hold today). GitHub pauses scheduled runs
-after 60 days without activity in this repository; a push or a manual run resumes them.
+The feed carries projects, not compiled plans: each planner downloads the active event's project,
+checks its hash and compiles it for the game module it installs, so a planner release needs no
+republish. The planner chooses the active event by time itself, so an event starts and ends on
+its dates without another publish; the daily run drops ended events from the feed. GitHub pauses
+scheduled runs after 60 days without activity in this repository; a push or a manual run resumes
+them.
 
 Merging a pull request that changes `events/` publishes at once. To preview first, run the
 workflow by hand on the pull request's branch with **dry run** on.
 
-### Recovering a failed publish
-
-The feed and its signature are uploaded together after the project files. If an upload stops
-part way, the published `events.json` and `events.json.sig` may not match, and the next run
-fails its verification on purpose rather than drop older builds' plans. Download the
-`event-feed-signed` artifact of the run that failed and upload both files again:
-
-```sh
-gh release upload events events.json events.json.sig --clobber
-```
+If an upload stops part way, run the workflow again: a published feed that differs or whose
+signature does not verify is signed afresh and replaced.
 
 ## Owner setup
 
